@@ -75,6 +75,42 @@ python proxy.py
  
 Add it to your startup folder (`Win + R` → `shell:startup`).
  
+## How Obsidian Copilot's internal prompt flow works
+ 
+This is undocumented behavior discovered by intercepting Copilot's requests.
+ 
+When you send a message in vault QA mode, Copilot doesn't send a single clean request to Ollama — it sends **three separate requests** in sequence:
+ 
+**Request 1 — Conversation summarization**
+```
+Given the following conversation and a follow up question,
+summarize the conversation as context and keep the follow up question as it is.
+...
+Follow Up Input: <your actual question>
+```
+This is used to compress conversation history into context. The real user question appears at the end under `Follow Up Input:`.
+ 
+**Request 2 — Vault search query analysis**
+```
+Analyze this search query and provide:
+1. SALIENT TERMS from the original query...
+```
+This is used internally to rank vault notes by relevance. It should not trigger a web search.
+ 
+**Request 3 — Final answer generation**
+```
+[CITATION RULES]
+...
+Answer the question based only on the following context:
+<retrieved_document>
+...
+</retrieved_document>
+<your actual question>
+```
+This is the request that generates the response the user sees. The real question appears after the vault context block.
+ 
+The proxy extracts the real query from requests 1 and 3 using pattern matching, skips request 2, and injects web search results as a high-priority prefix before forwarding to Ollama.
+ 
 ## Why this instead of alternatives?
  
 | Option               | Docker | Paid  | Auditable |
