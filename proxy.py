@@ -1,22 +1,71 @@
-import json
+import re
 import requests
 from flask import Flask, request, Response, jsonify
-from duckduckgo_search import DDGS
+from ddgs import DDGS
  
 # ── Config ────────────────────────────────────────────────────────────────────
 OLLAMA_URL   = "http://localhost:11434"
 PROXY_PORT   = 11435
-SEARCH_COUNT = 3       # number of web results to inject
+SEARCH_COUNT = 3
+ 
+# Only skip this one — it's a pure metadata request, not answer generation
+SKIP_IF_STARTS_WITH = (
+    "analyze this search query and provide",
+)
 # ─────────────────────────────────────────────────────────────────────────────
  
 app = Flask(__name__)
  
+@app.after_request
+def cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
+ 
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        return Response(status=200)
+ 
+ 
+def extract_query(text: str) -> str | None:
+    """Extract the real user question from any Copilot prompt format."""
+    lowered = text.strip().lower()
+ 
+    # Skip salient terms metadata request
+    if any(lowered.startswith(p) for p in SKIP_IF_STARTS_WITH):
+        return None
+ 
+    # Request 1 — conversation summarization: extract Follow Up Input
+    if "follow up input:" in lowered:
+        match = re.search(r"follow up input:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+ 
+    # Request 3 — answer generation: extract question after context block
+    if "answer the question based only" in lowered:
+        match = re.search(r"</retrieved_document>\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+        if match:
+            q = match.group(1).strip()
+            if q and len(q) < 500:
+                return q
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        return lines[-1] if lines else None
+ 
+    # Any other prompt — extract last meaningful line as query
+    lines = [l.strip() for l in text.splitlines() if l.strip() and len(l.strip()) > 10]
+    if lines:
+        # Prefer shorter lines (more likely to be the actual question)
+        candidates = [l for l in lines if len(l) < 200]
+        return candidates[-1] if candidates else lines[-1]
+ 
+    return None
+ 
  
 def web_search(query: str) -> str:
-    """Return top N DuckDuckGo results as plain text."""
     try:
-        with DDGS() as ddg:
-            results = list(ddg.text(query, max_results=SEARCH_COUNT))
+        results = DDGS().text(query, max_results=SEARCH_COUNT)
         if not results:
             return ""
         return "\n\n".join(
@@ -28,105 +77,76 @@ def web_search(query: str) -> str:
  
  
 def inject_context(messages: list) -> list:
-    """Prepend a system message with web search results based on the last user message."""
     last_user = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
     )
     if not last_user:
         return messages
  
-    print(f"[proxy] searching: {last_user[:80]}...")
-    context = web_search(last_user)
-    if not context:
+    query = extract_query(last_user)
+    if not query:
+        print(f"[proxy] skip: {last_user[:80]!r}")
         return messages
  
-    system_msg = {
-        "role": "system",
-        "content": (
-            "The following is real-time information retrieved from the web. "
-            "Use it to complement your knowledge when answering the user.\n\n"
-            f"{context}"
-        ),
-    }
+    print(f"[proxy] searching: {query[:80]!r}")
+    context = web_search(query)
+    if not context:
+        print("[proxy] no results")
+        return messages
  
-    # Replace existing system message or prepend a new one
-    if messages and messages[0].get("role") == "system":
-        messages[0]["content"] = system_msg["content"] + "\n\n" + messages[0]["content"]
-    else:
-        messages.insert(0, system_msg)
+    print(f"[proxy] injecting {len(context)} chars of web context")
+ 
+    web_block = (
+        "[WEB SEARCH RESULTS - prioritize this over vault context for current exploit details]\n\n"
+        f"{context}\n\n---\n\n"
+    )
+ 
+    for i in reversed(range(len(messages))):
+        if messages[i].get("role") == "user":
+            messages[i]["content"] = web_block + messages[i]["content"]
+            break
  
     return messages
  
  
-# ── /api/chat ─────────────────────────────────────────────────────────────────
-@app.route("/api/chat", methods=["POST"])
-def chat():
+def do_chat():
     data = request.get_json(force=True)
     data["messages"] = inject_context(data.get("messages", []))
- 
-    upstream = requests.post(
-        f"{OLLAMA_URL}/api/chat",
-        json=data,
-        stream=True,
-        timeout=120,
-    )
- 
-    return Response(
-        upstream.iter_content(chunk_size=None),
-        status=upstream.status_code,
-        content_type=upstream.headers.get("Content-Type", "application/json"),
-    )
+    upstream = requests.post(f"{OLLAMA_URL}/api/chat", json=data, stream=True, timeout=120)
+    return Response(upstream.iter_content(chunk_size=None),
+                    status=upstream.status_code,
+                    content_type=upstream.headers.get("Content-Type", "application/json"))
  
  
-# ── /api/generate ─────────────────────────────────────────────────────────────
-@app.route("/api/generate", methods=["POST"])
-def generate():
-    data = request.get_json(force=True)
-    prompt = data.get("prompt", "")
- 
-    print(f"[proxy] searching: {prompt[:80]}...")
-    context = web_search(prompt)
-    if context:
-        data["prompt"] = (
-            f"Real-time web context:\n{context}\n\n"
-            f"User prompt:\n{prompt}"
-        )
- 
-    upstream = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json=data,
-        stream=True,
-        timeout=120,
-    )
- 
-    return Response(
-        upstream.iter_content(chunk_size=None),
-        status=upstream.status_code,
-        content_type=upstream.headers.get("Content-Type", "application/json"),
-    )
- 
- 
-# ── Passthrough for everything else (models list, tags, etc.) ─────────────────
-@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
-def passthrough(path):
+def do_passthrough(path):
     url = f"{OLLAMA_URL}/{path}"
-    resp = requests.request(
-        method=request.method,
-        url=url,
-        json=request.get_json(silent=True),
-        params=request.args,
-        timeout=30,
-    )
+    resp = requests.request(method=request.method, url=url,
+                            json=request.get_json(silent=True),
+                            params=request.args, timeout=30)
     try:
         return jsonify(resp.json()), resp.status_code
     except Exception:
         return Response(resp.content, status=resp.status_code)
  
  
-# ── Root health check ─────────────────────────────────────────────────────────
+@app.route("/api/chat", methods=["POST"])
+@app.route("/v1/api/chat", methods=["POST"])
+def chat():
+    return do_chat()
+ 
+@app.route("/api/generate", methods=["POST"])
+@app.route("/v1/api/generate", methods=["POST"])
+def generate():
+    return do_chat()
+ 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ollama-web-proxy running", "port": PROXY_PORT})
+ 
+@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
+@app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
+def passthrough(path):
+    return do_passthrough(path)
  
  
 if __name__ == "__main__":
